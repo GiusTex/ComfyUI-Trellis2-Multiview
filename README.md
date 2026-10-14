@@ -3,13 +3,16 @@ Partial porting of [visualbruno's wrapper for Trellis2](https://github.com/visua
 
 <img width="1004" height="415" alt="NodesImg" src="https://github.com/user-attachments/assets/f34cff87-4db8-4e10-b097-944f7df60213" />
 
+#### Release notes
+- v1.0: Upload code with two working samplers, and workflow
+
 ### To do list:
 - [x] Upload working code and workflow
-- [ ] Make the conditioning node work with stock ksampler
-- [ ] Add the custom samplers in stock ksampler
+- [ ] Make the custom conditionings work in the native ksampler and stage nodes
+- [ ] Add the custom samplers in the native ksampler
+- [ ] Patch rk4 and rk5 samplers
 
- ### Details
-(WIP)
+### Details (WIP)
  
 [Workflow](https://github.com/GiusTex/ComfyUI-Trellis2-Multiview/blob/main/Trellis2-MultiView_workflow.json).
 
