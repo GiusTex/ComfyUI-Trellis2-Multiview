@@ -25,7 +25,7 @@ Partial porting of [visualbruno's wrapper for Trellis2](https://github.com/visua
 
 <img width="882" height="281" alt="Trellis2MultiView_NodesExtra_V1" src="https://github.com/user-attachments/assets/2c9a398d-dfb3-4fa6-b40b-c04e7ffeeb19" />
 
-Encoder (the [model](https://huggingface.co/microsoft/TRELLIS.2-4B/blob/main/ckpts/shape_enc_next_dc_f16c32_fp16.safetensors) goes in model/vae)
+Encoder (the [model](https://huggingface.co/microsoft/TRELLIS.2-4B/blob/main/ckpts/shape_enc_next_dc_f16c32_fp16.safetensors) goes in models/vae)
 
 
 ### Credits
