@@ -141,7 +141,7 @@ class Trellis2EncodeShapeLatent(io.ComfyNode):
             grid_range,
             face_weight=1.0, 
             boundary_weight=0.2, 
-            regularization_weight=1e2,
+            regularization_weight=1e-2,
         )
         voxel_indices = voxel_indices.cpu()
         dual_vertices = dual_vertices.cpu()
