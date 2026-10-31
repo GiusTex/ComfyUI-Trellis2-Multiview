@@ -1,11 +1,3 @@
-"""
-Encoder shape di Trellis2 gestito nativamente da ComfyUI (ModelPatcher).
-
-Nodi:
-  Trellis2LoadVaeEncoder          -> carica il .safetensors da models/vae, restituisce un ModelPatcher
-  Trellis2EncodeShapeSlatNative   -> mesh / model_3d -> shape slat (stesso output di VaeEncodeShapeTrellis2)
-  Trellis2CompareShapeSlat        -> confronto A/B tra due shape slat (per validare il nodo nativo)
-"""
 import gc
 import copy
 import torch
@@ -22,9 +14,10 @@ from comfy_extras.nodes_trellis2 import shape_slat_format
 
 from .encoder_class import FlexiDualGridVaeEncoder
 
-_BYTES_PER_VOXEL = 1700 # last check: voxel=4159094 peak=5868 MiB -> 1479 B/voxel
-
 from .encoder_utils import set_conv_backend
+from .flexible_dual_grid import mesh_to_flexible_dual_grid
+
+_BYTES_PER_VOXEL = 1700 # last check: voxel=4159094 peak=5868 MiB -> 1479 B/voxel
 
 
 class Trellis2LoadVaeEncoder(io.ComfyNode):
@@ -78,8 +71,6 @@ class Trellis2LoadVaeEncoder(io.ComfyNode):
         )
         return io.NodeOutput(patcher)
 
-
-from .flexible_dual_grid import mesh_to_flexible_dual_grid
 
 class Trellis2EncodeShapeLatent(io.ComfyNode):
     @classmethod
@@ -169,7 +160,7 @@ class Trellis2EncodeShapeLatent(io.ComfyNode):
 
         bad = [n for n, p in trellis2_encoder.model.named_parameters() if p.device != device]
         if bad:
-            print(f"[Trellis2 Encode ShapeSlat] {len(bad)} parameters not on GPU (es. {bad[:3]}): model manually moved")
+            print(f"[Trellis2 Encode Shape Latent] {len(bad)} parameters not on GPU (es. {bad[:3]}): model manually moved")
             trellis2_encoder.model.to(device)
         
         # Encode
