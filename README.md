@@ -1,9 +1,12 @@
 # ComfyUI-Trellis2-Multiview
 Partial porting of [visualbruno's wrapper for Trellis2](https://github.com/visualbruno/ComfyUI-Trellis2) in native ComfyUI; specifically, this extensions adds visualbruno's [multiview samplers](https://github.com/visualbruno/ComfyUI-Trellis2/blob/main/trellis2/pipelines/samplers/flow_euler.py) for Trellis2.
 
-<img width="296" height="387" alt="Trellis2MultiView_Nodes_V1" src="https://github.com/user-attachments/assets/d281c2bb-fab8-4f58-b4e4-98d978d3d498" />
+<img width="270" height="334" alt="image" src="https://github.com/user-attachments/assets/d0ad3f98-58ba-4bda-9a2d-87563cecb961" />
 
 #### Release notes
+- v1.1, 31/10/2026:
+  - Made the guider work with native OverrideCFG and RescaleCFG nodes;
+  - Simplified the code, and made it rely on native guider functions
 - v1.0, 25/10/2026:
   - Patched rk4 and rk5 samplers;
   - Made multi-view conditionings work with native stage nodes;
@@ -17,6 +20,7 @@ Partial porting of [visualbruno's wrapper for Trellis2](https://github.com/visua
 - [x] Make the custom conditionings work in the native stage nodes
 - ~~[ ] Add the custom samplers in the native ksampler~~
 - [x] Patch rk4 and rk5 samplers
+- [x] Make the guider work with native OverrideCFG and RescaleCFG nodes
 
 ### Details (WIP)
  
