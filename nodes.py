@@ -1,69 +1,108 @@
 import torch
+from tqdm.auto import trange
 
 import comfy.model_management
 from comfy_api.latest import IO, io
+from comfy.samplers import process_conds, sampling_function
 
-from comfy_extras.nodes_trellis2 import (infer_batched_coord_layout, _dino_encode_batch,
-                                        flatten_batched_sparse_latent, shape_norm)
-
-from .trellis2.pipelines import samplers
-from comfy.ldm.trellis2.model import compute_stage_proj_feats
-
-from .utils import tensor2pil
+from comfy_extras.nodes_trellis2 import _dino_encode_batch
 
 
-class Trellis2SamplerSelect(IO.ComfyNode):
+class Trellis2MultiViewSamplerSelect(io.ComfyNode):
     @classmethod
-    def define_schema(cls):
-        return IO.Schema(
-            node_id="Trellis2SamplerSelect",
-            display_name="Trellis2 Sampler Select",
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="Trellis2MultiViewSamplerSelect",
+            display_name="Trellis2 Multi-View Sampler Select",
             category="model/conditioning/trellis",
-            description="Trellis2/Pixal3d samplers for single/multi view referenced generation",
             inputs=[
-                IO.Combo.Input("sampler_name", ["euler", "heun", "rk4", "rk5"], default="euler"),
-                IO.Combo.Input("stage", ["sparse", "shape (res 512)", "shape (res 1024)", "upsample/texture"], default="sparse"),
+                io.Combo.Input("sampler_name", options=["euler", "heun", "rk4", "rk5"]),
             ],
-            outputs=[
-                IO.Sampler.Output(display_name="sampler"),
-            ]
+            outputs=[io.Sampler.Output()],
         )
 
     @classmethod
-    def getSamplerName(cls, sampler):
-        if sampler == 'euler':
-            return 'Euler'
-        elif sampler == 'heun':
-            return 'Heun'
-        elif sampler == 'rk4':
-            return 'RK4'
-        elif sampler == 'rk5':
-            return 'RK5'
+    def execute(cls, sampler_name):
+        # SAMPLERS: each step receives (get_blended_v, x, t, dt) and returns (x_next, k1)
+        # Based on FlowEulerMultiViewSampler.sample_once()
+        def _step_euler(get_blended_v, x, t, dt, t_next):
+            k1 = get_blended_v(latent=x, sigma=t)
+
+            pred_x_prev = x - (t - t_next) * k1
+            return pred_x_prev, k1
+
+        # Based on FlowHeunMultiViewSampler.sample_once()
+        def _step_heun(get_blended_v, x, t, dt, t_next):
+            # Heun's Method (RK2) Evaluations
+            # Step 1: Predictor (Euler step)
+            k1 = get_blended_v(latent=x, sigma=t)
+            x_temp = x + k1 * dt
+
+            # Step 2: Corrector
+            k2 = get_blended_v(latent=x_temp, sigma=t + dt)
+
+            # Combine
+            pred_x_prev = x + 0.5 * dt * (k1 + k2)
+            return pred_x_prev, k1
+
+        # Based on FlowRK4MultiViewSampler.sample_once()
+        def _step_rk4(get_blended_v, x, t, dt, t_next):
+            k1 = get_blended_v(x, t)
+            k2 = get_blended_v(x + k1 * (0.5 * dt), t + 0.5 * dt)
+            k3 = get_blended_v(x + k2 * (0.5 * dt), t + 0.5 * dt)
+            k4 = get_blended_v(x + k3 * dt, t + dt)
+
+            pred_x_prev = x + (k1 + k2 * 2 + k3 * 2 + k4) * (dt / 6.0)
+            return pred_x_prev, k1
+
+        # Based on FlowRK5MultiViewSampler.sample_once()
+        def _step_rk5(get_blended_v, x, t, dt, t_next):
+            # Butcher Tableau Intermediate steps
+            c2, c3, c4, c5, c6 = 1/4, 1/4, 1/2, 3/4, 1.0
+
+            k1 = get_blended_v(x, t)
+            k2 = get_blended_v(x + k1 * (dt * 1/4), t + dt * c2)
+            k3 = get_blended_v(x + (k1 * 1/8 + k2 * 1/8) * dt, t + dt * c3)
+            k4 = get_blended_v(x + (k2 * -1/2 + k3 * 1.0) * dt, t + dt * c4)
+            k5 = get_blended_v(x + (k1 * 3/16 + k4 * 9/16) * dt, t + dt * c5)
+            k6 = get_blended_v(x + (k1 * -3/7 + k2 * 2/7 + k3 * 12/7 + k4 * -12/7 + k5 * 8/7) * dt, t + dt * c6)
+            
+            pred_x_prev = x + (k1 * 7/90 + k3 * 32/90 + k4 * 12/90 + k5 * 32/90 + k6 * 7/90) * dt
+            return pred_x_prev, k1
+
+        if sampler_name == "heun":
+            sampler_function = _step_heun
+        elif sampler_name == "rk4":
+            sampler_function = _step_rk4
+        elif sampler_name == "rk5":
+            sampler_function = _step_rk5
         else:
-            return 'Euler'  
+            sampler_function = _step_euler
     
-    @classmethod
-    def execute(cls, sampler_name, stage):
-        sampler_prefix = cls.getSamplerName(sampler_name)        
-        flow_model_resolution = 64
-        
-        if stage == "sparse":
-            sampler_class = getattr(samplers, f"Flow{sampler_prefix}MultiViewGuidanceIntervalSampler", samplers.FlowEulerMultiViewGuidanceIntervalSampler)
-            flow_model_resolution = 16
-        elif stage == "shape (res 512)":
-            sampler_class = getattr(samplers, f"Flow{sampler_name}MultiViewGuidanceIntervalSampler", samplers.FlowEulerMultiViewGuidanceIntervalSampler)
-            flow_model_resolution = 32
-        elif stage == "shape (res 1024)":
-            sampler_class = getattr(samplers, f"Flow{sampler_name}MultiViewGuidanceIntervalSampler", samplers.FlowEulerMultiViewGuidanceIntervalSampler)
-        elif stage == "upsample/texture": # (1024 texture model)
-            sampler_class = getattr(samplers, f"Flow{sampler_prefix}MultiViewGuidanceIntervalSampler", samplers.FlowEulerMultiViewGuidanceIntervalSampler)
+        @torch.no_grad()
+        def sampler(model, x, sigmas, extra_args=None, callback=None, disable=None, **kw):
+            ts = sigmas.tolist()
 
-        sampler = sampler_class(
-            sigma_min=1e-5,
-            resolution=flow_model_resolution
-        )
-        return IO.NodeOutput(sampler)
+            def get_v(latent, sigma):
+                t_tensor = torch.full((latent.shape[0],), sigma, device=latent.device, dtype=torch.float32)
+                return extra_args["get_blended_v"](latent, t_tensor)
+    
+            for i in trange(len(sigmas) - 1, disable=disable):
+                t, t_next = ts[i], ts[i + 1]
+                dt = t_next - t
 
+                pred_x_prev, k1 = sampler_function(get_v, x, t, dt, t_next)
+
+                if callback is not None:
+                    # Estimate pred_x_0 based on k1 for tracking
+                    pred_x_0 = x - t * k1
+                    callback({"x": x, "i": i, "sigma": sigmas[i], "sigma_hat": sigmas[i], 
+                            "denoised": pred_x_0})
+                
+                x = pred_x_prev
+            return x
+
+        return io.NodeOutput(comfy.samplers.KSAMPLER(sampler))
 
 class Trellis2MultiViewConditioning(IO.ComfyNode):
     @classmethod
@@ -74,10 +113,10 @@ class Trellis2MultiViewConditioning(IO.ComfyNode):
             category="model/conditioning/trellis",
             inputs=[
                 IO.ClipVision.Input("clip_vision_model"),
-                IO.Image.Input("front", tooltip="Preprocessed image from ImageCropToMask (pad_factor=1.0 for TRELLIS.2)."),
-                IO.Image.Input("left", optional=True, tooltip="Preprocessed image from ImageCropToMask (pad_factor=1.0 for TRELLIS.2)."),
-                IO.Image.Input("back", optional=True, tooltip="Preprocessed image from ImageCropToMask (pad_factor=1.0 for TRELLIS.2)."),
-                IO.Image.Input("right", optional=True, tooltip="Preprocessed image from ImageCropToMask (pad_factor=1.0 for TRELLIS.2)."),
+                IO.Image.Input("front", optional=True),
+                IO.Image.Input("left", optional=True),
+                IO.Image.Input("back", optional=True),
+                IO.Image.Input("right", optional=True),
             ],
             outputs=[
                 IO.Conditioning.Output(display_name="positive"),
@@ -86,103 +125,243 @@ class Trellis2MultiViewConditioning(IO.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, clip_vision_model, front, left=None, back=None, right=None) -> IO.NodeOutput:
+    def execute(cls, clip_vision_model, front=None, left=None, back=None, right=None) -> IO.NodeOutput:
         out_device = comfy.model_management.intermediate_device()
         
         # Collect views
-        tensor_views = {'front': front}
-        views = {'front': tensor2pil(front)}
-        if left is not None:
-            tensor_views['left'] = left
-            views['left'] = tensor2pil(left)
-        if back is not None:
-            tensor_views['back'] = back
-            views['back'] = tensor2pil(back)
-        if right is not None:
-            tensor_views['right'] = right
-            views['right'] = tensor2pil(right)
+        views = {}
+        if front is not None: views['front'] = front
+        if left is not None: views['left'] = left
+        if back is not None: views['back'] = back
+        if right is not None: views['right'] = right
+        if front is None and left is None and right is None and back is None:
+            raise ValueError("[Trellis2 Multi-View Conditioning]: At least an image is required!")
+        
         views_list = list(views.keys())
 
-        positive_512 = {}
-        positive_1024 = {}
-        negative_512 = {}
-        negative_1024 = {}
+        positive, positive_embeds = {}, {}
+        negative, negative_embeds = {}, {}
         # Calculate conditioning per view
-        for v, img in tensor_views.items():
+        for v, img in views.items():
             cond = _dino_encode_batch(clip_vision_model, img, out_device)
-            cond_512_batched = cond["global_512"]
-            cond_1024_batched = cond["global_1024"]
-            neg_cond_batched = torch.zeros_like(cond_512_batched)
-            neg_embeds_batched = torch.zeros_like(cond_1024_batched)
-            
-            positive_512[v] = {"cond": cond_512_batched}
-            positive_1024[v] = {"cond": cond_1024_batched}
-            negative_512[v] = {"neg_cond": neg_cond_batched}
-            negative_1024[v] = {"neg_cond": neg_embeds_batched}
+            positive[v] = cond["global_512"]
+            positive_embeds[v] = cond["global_1024"]
+
+            negative[v] = torch.zeros_like(cond["global_512"])
+            negative_embeds[v] = torch.zeros_like(cond["global_1024"])
         
-        positive_512["extras"] = {"embeds": positive_1024}
-        negative_512["extras"] = {"embeds": negative_1024}
+        pos_extras = {
+            "embeds": positive_embeds[views_list[0]], "views_list": views_list,
+            "true_positive": positive,
+            "true_positive_embeds": positive_embeds,
+        }
+        neg_extras = {
+            "embeds": negative_embeds[views_list[0]],
+            "true_negative": negative,
+            "true_negative_embeds": negative_embeds,
+        }
 
-        positive_512["extras"]["views_list"] = views_list
-
-        del tensor_views
-        return IO.NodeOutput(positive_512, negative_512)
-
-
-class Trellis2CFGGuiderClass(comfy.samplers.CFGGuider):
-    def set_trellis2_opt(self,
-        cond, neg_cond, extras,
-        views, front_axis, blend_temperature, verbose, 
-        tqdm_desc, sampler_params,
-        dino_lock, dino_substeps, dino_foundation_cap):
-
-        self.cond = cond
-        self.neg_cond = neg_cond
-        self.extras = extras
-        self.views = views
-        self.front_axis = front_axis
-        self.blend_temperature = blend_temperature
-        self.verbose = verbose
-        self.tqdm_desc = tqdm_desc
-        self.sampler_params = sampler_params
-        self.dino_lock = dino_lock
-        self.dino_substeps = dino_substeps
-        self.dino_foundation_cap = dino_foundation_cap
-    
-    def cast_dtype(self, x_t, t, cond, **kw):
-        dtype = self.inner_model.get_dtype()
-        dev = x_t.device
-        xc = x_t.to(dtype)
-        
-        def _mv(v):
-            if not torch.is_tensor(v):
-                return v
-            if torch.is_floating_point(v):
-                return v.to(device=dev, dtype=dtype)
-            return v.to(device=dev)
-
-        ctx = _mv(cond)
-        kw_c = {k: _mv(v) for k, v in kw.items()}
-        t = t.to(device=dev) if torch.is_tensor(t) else t
-        out = self.inner_model.diffusion_model(
-            xc, t, ctx, 
-            transformer_options=self.model_options.get("transformer_options", {}), 
-            **kw_c
+        # We don't actually use the single tensors (positive[views_list[0]] and negative[views_list[0]),
+        # but to use the default stage nodes this structure is required.
+        # The "true_positive" etc are handled (cast to device etc) inside the guider
+        return IO.NodeOutput(
+            [[positive[views_list[0]], pos_extras]],
+            [[negative[views_list[0]], neg_extras]]
         )
-        return out.float()
+
+
+class MultiViewCFGGuider(comfy.samplers.CFGGuider):
+    def set_trellis2_opt(self, views, blend_temperature, coords_resolution, extras):
+
+        self.views = views
+        self.blend_temperature = blend_temperature
+        self.resolution = coords_resolution
+        self.extras = extras
+        self.sigma_min = 1e-5
+        self.extra_model_options = None
+        self.seed = None
+
+    def inner_set_conds(self, conds):
+        pos_extras = conds["positive"][0][1]
+        neg_extras = conds["negative"][0][1]
+
+        # positive: views dict at 512; positive_embeds: views dict at 1024
+        # negative: views dict at 512; negative_embeds: views dict at 1024
+        for v in self.views:
+            conds[f"positive_{v}"] = [[
+                pos_extras["true_positive"][v],
+                {**self.extras, "embeds": pos_extras["true_positive_embeds"][v]}
+            ]]
+            conds[f"negative_{v}"] = [[
+                neg_extras["true_negative"][v],
+                {**self.extras, "embeds": neg_extras["true_negative_embeds"][v]}
+            ]]
+
+        super().inner_set_conds(conds)
+
+    # Taken as is from https://github.com/visualbruno/ComfyUI-Trellis2/blob/main/trellis2/pipelines/samplers/flow_euler.py, in FlowEulerMultiViewSampler
+    def _compute_view_weights_sparse(self, coords, views, blend_temperature=2.0, front_axis='z') -> torch.Tensor:
+        """
+        Compute blending weights for sparse voxels.
+        """
+        # Normalize coords to [-1, 1] range (roughly)
+        z = (coords[:, 1].float() / self.resolution) * 2 - 1.0
+        x = (coords[:, 3].float() / self.resolution) * 2 - 1.0
+
+        if front_axis == 'z':
+            # Front (+Z), Back (-Z), Right (+X), Left (-X)
+            view_vectors = {
+                'front': torch.stack([torch.zeros_like(z), z], dim=1), # (0, z)
+                'back':  torch.stack([torch.zeros_like(z), -z], dim=1),
+                'right': torch.stack([x, torch.zeros_like(x)], dim=1),
+                'left':  torch.stack([-x, torch.zeros_like(x)], dim=1),
+            }
+        else: # front_axis == 'x' (swapped)
+            # Front (+X), Back (-X), Right (+Z), Left (-Z)
+             view_vectors = {
+                'front': torch.stack([x, torch.zeros_like(x)], dim=1),
+                'back':  torch.stack([-x, torch.zeros_like(x)], dim=1),
+                'right': torch.stack([torch.zeros_like(z), z], dim=1),
+                'left':  torch.stack([torch.zeros_like(z), -z], dim=1),
+            }
+
+        scores = []
+        for view in views:
+            if view in view_vectors:
+                v_vec = view_vectors[view]
+                score = v_vec.sum(dim=1)
+                scores.append(score)
+            else:
+                scores.append(torch.full_like(z, -10.0))
+        
+        scores = torch.stack(scores, dim=1) # (N, num_views)
+        weights = torch.softmax(scores * blend_temperature, dim=1)
+        return weights
+    
+    # Taken as is from https://github.com/visualbruno/ComfyUI-Trellis2/blob/main/trellis2/pipelines/samplers/flow_euler.py, in FlowEulerMultiViewSampler
+    def _compute_view_weights_dense(self, shape, device, views, blend_temperature=2.0, front_axis='z') -> torch.Tensor:
+        """
+        Compute blending weights for dense grid (B, C, D, H, W).
+        Returns weights of shape (1, 1, D, H, W, NumViews) for easy broadcasting (actually we want (1, 1, D, H, W) per view)
+        """
+        # shape is (B, C, D, H, W)
+        D, H, W = shape[2], shape[3], shape[4]
+        
+        # Create meshgrid in [-1, 1]
+        # We assume D is Z axis, W is X axis (usually D, H, W = Z, Y, X in 3D tensors?)
+        # Let's verify standard: (Batch, Channel, Depth, Height, Width) -> (B, C, Z, Y, X)
+        
+        dz = torch.linspace(-1, 1, D, device=device)
+        dy = torch.linspace(-1, 1, H, device=device)
+        dx = torch.linspace(-1, 1, W, device=device)
+        
+        # meshgrid 'ij' indexing: (D, H, W) order
+        grid_z, grid_y, grid_x = torch.meshgrid(dz, dy, dx, indexing='ij') 
+        
+        # Flatten for vector calc? Or keep structural. Keep structural.
+        
+        if front_axis == 'z':
+             # Front (+Z), Back (-Z), Right (+X), Left (-X)
+             # Vectors are scalar fields here
+             view_scores = {
+                 'front': grid_z,
+                 'back': -grid_z,
+                 'right': grid_x,
+                 'left': -grid_x,
+             }
+        else:
+             view_scores = {
+                 'front': grid_x,
+                 'back': -grid_x,
+                 'right': grid_z,
+                 'left': -grid_z,
+             }
+             
+        scores = []
+        for view in views:
+            if view in view_scores:
+                scores.append(view_scores[view])
+            else:
+                scores.append(torch.full_like(grid_z, -10.0))
+                
+        # Stack: (NumViews, D, H, W)
+        scores = torch.stack(scores, dim=0) 
+
+        # Softmax over views dimension (0)
+        weights = torch.softmax(scores * blend_temperature, dim=0)
+        
+        # Reshape for broadcasting: (NumViews, 1, 1, D, H, W) -> No wait, loop is over views.
+        # We want to return something we can index like weights[i] -> (1, 1, D, H, W)
+        
+        # Current shape: (NumViews, D, H, W)
+        return weights
+
+    def sample_once(self, x):
+        coords = self.extras.get("trellis2_coords", None)
+        is_sparse = True if coords is not None else False
+
+        if is_sparse:
+            # Compute per-voxel weights based on current sparse coords
+            weights = self._compute_view_weights_sparse(
+                coords, self.views, self.blend_temperature)
+            weights = weights.t().reshape(len(self.views), 1, 1, -1, 1) # (V,1,1,N,1)
+        else:
+            # Dense tensor
+            weights = self._compute_view_weights_dense(
+                x.shape, x.device, self.views, self.blend_temperature)
+
+        return weights
+        
+    def predict_noise(self, x, timestep, model_options=None, seed=None):
+        """
+        Sample with multi-view blending.
+        """
+        model_options = model_options or self.extra_model_options
+        seed = self.seed if seed is None else seed
+        
+        # Follow wrapper pipeline: skip cfg rescale when cfg is 1 or 0
+        if self.cfg == 1 or self.cfg == 0:
+            model_options = {k: v for k, v in model_options.items()
+                            if k != "sampler_cfg_function"}
+
+        # Avoids reduction dim 0 to have zero sizes
+        # Required for Heun, Rk4, Rk5 samplers
+        timestep = timestep.clamp(min=self.sigma_min) # never 0
+
+        # Run model for each view and blend predictions
+        pred_v_accum = x.clone()
+
+        for i, view in enumerate(self.views):
+            pred_v_view = sampling_function(
+                self.inner_model, x, timestep,
+                self.conds[f"negative_{view}"], self.conds[f"positive_{view}"], 
+                self.cfg, model_options=model_options, seed=seed
+            )
+
+            # Weighted accumulation
+            w = self.weights[i]
+            pred_v_accum += (pred_v_view - x) * w
+
+        # x0 -> v
+        return (x.float() - pred_v_accum.float()) / timestep.flatten()[0]
 
     def inner_sample(self, noise, latent_image, device, sampler, sigmas, denoise_mask, callback, disable_pbar, seed, latent_shapes=None):
         self.inner_model.latent_shapes = latent_shapes
 
-        #if latent_image is not None and torch.count_nonzero(latent_image) > 0: # Don't shift the empty latent image.
-        #    latent_image = self.inner_model.process_latent_in(latent_image)
+        if latent_image is not None and torch.count_nonzero(latent_image) > 0: # Don't shift the empty latent image.
+            latent_image = self.inner_model.process_latent_in(latent_image)
 
-        #device = device=self.model_patcher.offload_device
-        #self.conds = process_conds(self.inner_model, noise, self.conds, device, latent_image, denoise_mask, seed, latent_shapes=latent_shapes)
+        self.conds = process_conds(self.inner_model, noise, self.conds, device, latent_image, denoise_mask, seed, latent_shapes=latent_shapes)
 
         extra_model_options = comfy.model_patcher.create_model_options_clone(self.model_options)
         extra_model_options.setdefault("transformer_options", {})["sample_sigmas"] = sigmas
         extra_args = {"model_options": extra_model_options, "seed": seed}
+
+        self.weights = self.sample_once(noise)
+        extra_args["get_blended_v"] = self.__call__
+        extra_args["sigma_min"] = self.sigma_min
+        self.extra_model_options = extra_model_options
+        self.seed = seed
 
         executor = comfy.patcher_extension.WrapperExecutor.new_class_executor(
             sampler.sample,
@@ -193,26 +372,8 @@ class Trellis2CFGGuiderClass(comfy.samplers.CFGGuider):
                 is_model_options=True
             )
         )
-
-        #samples = executor.execute(self, sigmas, extra_args, callback, noise, latent_image, denoise_mask, disable_pbar)
-        samples = executor.execute(
-            self.cast_dtype,
-            noise,
-            cond=self.cond, neg_cond=self.neg_cond,
-            **self.sampler_params,
-            views=self.views,
-            front_axis=self.front_axis,
-            steps=len(sigmas) - 1,
-            blend_temperature=self.blend_temperature,
-            concat_cond=self.extras.get("trellis2_shape_slat", None), # if self.extras is not None else None,
-            verbose=self.verbose,
-            dino_lock=self.dino_lock,
-            dino_substeps=self.dino_substeps,
-            dino_foundation_cap=self.dino_foundation_cap,
-            tqdm_desc=self.tqdm_desc,
-            **self.extras,
-        ).samples
-        
+        with self.model_patcher.writable_models(self.conds, noise.shape, self.model_options):
+            samples = executor.execute(self, sigmas, extra_args, callback, noise, latent_image, denoise_mask, disable_pbar)
         return self.inner_model.process_latent_out(samples.to(torch.float32))
 
 
@@ -221,20 +382,16 @@ class Trellis2MultiViewCFGGuider(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="Trellis2MultiViewCFGGuider",
-            display_name="Trellis2 MultiView CFG Guider",
+            display_name="Trellis2 Multi-View CFG Guider",
             category="model/sampling/guiders",
             description="A guider for multi-view reference generation (requires conditionings from \"Trellis2 Multi-View Conditioning\" and \"Trellis2 Multiview Sampler Select\").",
             inputs=[
-                io.Model.Input("model"),
-                io.Conditioning.Input("positive"),
-                io.Conditioning.Input("negative"),
-                IO.Float.Input("guidance_strength", default=6.50, min=0.00, max=99.99, step=0.01),
-                IO.Float.Input("guidance_rescale", default=0.05,  min=0.00, max=1.00, step=0.01),
-                IO.Float.Input("rescale_t", default=4.00, min=0.00, max=9.99, step=0.01),
-                IO.Float.Input("guidance_interval_start", default=0.10, min=0.00, max=1.00, step=0.01),
-                IO.Float.Input("guidance_interval_end", default=1.00, min=0.00, max=1.00, step=0.01),
+                IO.Model.Input("model"),
+                IO.Conditioning.Input("positive", tooltip="positive from \"Trellis2 Multi-View Conditioning\" node"),
+                IO.Conditioning.Input("negative", tooltip="negative from \"Trellis2 Multi-View Conditioning\" node"),
+                IO.Float.Input("cfg", default=7.50, min=0.00, max=99.99, step=0.01),
                 IO.Float.Input("blend_temperature", default=1.0, min=0.1, max=10.0, step=0.1),
-                IO.Boolean.Input("verbose", default=False),
+                IO.Int.Input("coords_resolution", default=32, min=32, max=2048, step=32, tooltip="Default at structure generation resolution. Other stage resolutions can be acquired with \"Trellis2 Get Mesh and Coords Resolution\" node"),
             ],
             outputs=[
                 io.Guider.Output("guider"),
@@ -242,346 +399,38 @@ class Trellis2MultiViewCFGGuider(io.ComfyNode):
         )
     
     @classmethod
-    def execute(cls, model, 
-        positive, negative,
-        guidance_strength, guidance_rescale, 
-        rescale_t, guidance_interval_start, 
-        guidance_interval_end, blend_temperature, 
-        verbose):
-
-        guider = Trellis2CFGGuiderClass(model)
-        device = comfy.model_management.get_torch_device()
-
-        guidance_interval=[guidance_interval_start,guidance_interval_end]        
-        sampler_params = {
-            "guidance_strength": guidance_strength,
-            "guidance_rescale": guidance_rescale,
-            "guidance_interval": guidance_interval,
-            "rescale_t": rescale_t
-        }
-
-        extras = dict(positive.get("extras") or {})
-        neg_extras = negative.get("extras") or {}
-        stage = positive.get("stage") or "sparse_generation"
-
-        proj_pack = positive["extras"].get("proj_feat_pack", None)
-        views_list = positive["extras"].get("views_list", None)
-        if proj_pack is not None:
-            # We don't want the global cond etc
-            raise ValueError("Pixal3d settings found in positive/negative. Encode them for Trellis2.\nPixal3d, also, requires \Trellis2 CFG Guider\" node.")
+    def execute(cls, model, positive, negative, cfg, blend_temperature, coords_resolution):
+        pos_extras = positive[0][1]
+        views_list = pos_extras.get("views_list")
         if views_list is None:
-            # We need views_list for the visualbruno multiview samplers
             raise ValueError("views_list not found in the positive conditioning!")
         
-        cond = {v: positive[v]["cond"].to(device) for v in views_list}
-        neg_cond = {v: negative[v]["neg_cond"].to(device) for v in views_list}
-        # embeds 1024 per view: from nested dict to {view: tensor}
-        extras["embeds"] = {v: extras["embeds"][v]["cond"].to(device) for v in views_list}
-        extras["neg_embeds"] = {v: neg_extras["embeds"][v]["neg_cond"].to(device) for v in views_list}
+        _CUSTOM_KEYS = {"views_list", "true_positive", "true_positive_embeds",
+                "true_negative", "true_negative_embeds", "embeds", "neg_embeds"}
+        extras = {k: v for k, v in pos_extras.items() if k not in _CUSTOM_KEYS}
 
-        extras["is_padded_sparse"] = False
-        extras["is_padded_dense"] = False
-        if stage == "shape_generation":
-            tqdm_desc = "Sampling shape SLat (MultiView)"
-            extras["is_padded_sparse"] = True
-        elif stage == "shape_generation_cascade":
-            tqdm_desc = "Sampling shape SLat (MultiView HR)"
-            extras["is_padded_dense"] = True
-        elif stage == "texture_generation":
-            tqdm_desc="Sampling texture SLat (MultiView)"
-            extras["is_padded_dense"] = True
-        else:
-            tqdm_desc = "Sampling sparse structure (MultiView)"
-            # is_dense
-        
+        guider = MultiViewCFGGuider(model)
+        guider.set_cfg(cfg)
+
         guider.set_trellis2_opt(
-            cond=cond,
-            neg_cond=neg_cond,
-            extras=extras,
-            views=views_list,
-            front_axis="x", # Trellis2
-            blend_temperature=blend_temperature,            
-            verbose=verbose,
-            tqdm_desc=tqdm_desc,
-            sampler_params = sampler_params,
-            dino_lock = 0.0,
-            dino_substeps = 4,
-            dino_foundation_cap = 1.0,
-        )
+            views=views_list, 
+            blend_temperature=blend_temperature,
+            coords_resolution=coords_resolution, 
+            extras=extras)
         
+        guider.set_conds(positive, negative)
+
         return io.NodeOutput(guider)
-
-
-class Trellis2ShapeStageAlt(IO.ComfyNode):
-    """Sets up the first shape-stage sampling pass: extracts sparse coords from
-    the dense structure voxel produced by VaeDecodeStructureTrellis2, builds an
-    empty sparse latent, and attaches per-stage metadata to the conditioning so
-    the model reads it via extra_conds at sample time. For the second shape pass
-    (post-upsample), use Trellis2UpsampleStage instead — it combines the cascade
-    and the second-pass stage setup."""
-    @classmethod
-    def define_schema(cls):
-        return IO.Schema(
-            node_id="Trellis2ShapeStageAlt",
-            category="model/conditioning/trellis2",
-            display_name="Trellis2 Shape Stage Alt",
-            inputs=[
-                IO.Conditioning.Input("positive"),
-                IO.Voxel.Input("voxel", tooltip="Dense structure voxel from VaeDecodeStructureTrellis2."),
-                IO.Combo.Input("model_res", ["512", "1024"], default="1024"),
-            ],
-            outputs=[
-                IO.Conditioning.Output(display_name="shape positive"),
-                IO.Latent.Output(display_name="shape latent"),
-            ]
-        )
-
-    @classmethod
-    def execute(cls, positive, voxel, model_res):
-        decoded = voxel.data.unsqueeze(1)
-        coords = torch.argwhere(decoded.bool())[:, [0, 2, 3, 4]].int()
-        coord_resolution = int(decoded.shape[-1])
-
-        # Dispatch based on the upstream voxel resolution, mirroring upstream's
-        # pipeline_type → ss_res table:
-        #   coord_res == 32 → first cascade shape pass OR pure-512 pipeline
-        #                     (img2shape_512 + shape_512 proj stage, 512 DINO).
-        #   coord_res >  32 → pure-1024 non-cascade pipeline
-        #                     (img2shape + shape_1024 proj stage, 1024 DINO).
-        #if coord_resolution <= 32:
-        if model_res == "512":
-            mode = "shape_generation_512"
-            stage = "shape_512"
-        else:
-            mode = "shape_generation"
-            stage = "shape_1024"
-
-        batch_size, counts, max_tokens = infer_batched_coord_layout(coords)
-        latent = torch.zeros(batch_size, 32, max_tokens, 1)
-
-        prev_extras = positive["extras"]
-        #proj_pack = _proj_pack_from_conditioning(positive)
-        proj_pack = prev_extras.get("proj_feat_pack", None)
-        extras = {
-            #"trellis2_generation_mode": "shape_generation_512" if model_res == "512" else "shape_generation",
-            **prev_extras,
-            "trellis2_generation_mode": mode,
-            "trellis2_coords": coords,
-            "trellis2_coord_counts": counts,
-            "coord_resolution": coord_resolution,
-        }
-        if proj_pack is not None:
-            extras["trellis2_proj_feats"] = compute_stage_proj_feats(
-                proj_pack, stage, coords=coords, coord_resolution=coord_resolution,
-            )
-
-        positive_out = dict(positive)
-        positive_out["extras"] = extras
-        positive_out["stage"] = "shape_generation"
-
-        out_latent = {
-            "samples": latent, 
-            "coords": coords, "coord_counts": counts,"coord_resolution": coord_resolution, 
-            "type": "trellis2",
-            "model_frame": "y_up" if proj_pack is not None else "z_up"
-        }
-        return IO.NodeOutput(positive_out, out_latent)
-
-
-class Trellis2UpsampleStageAlt(IO.ComfyNode):
-    """Cascade-upsamples a 512-resolution shape latent into high-resolution
-    sparse coords and sets up the second shape-stage sampling pass at the
-    target resolution, attaching per-stage metadata to the conditioning for
-    the model to consume via extra_conds."""
-    @classmethod
-    def define_schema(cls):
-        return IO.Schema(
-            node_id="Trellis2UpsampleStageAlt",
-            category="model/conditioning/trellis",
-            display_name="Trellis2 Upsample Stage Alt",
-            inputs=[
-                IO.Conditioning.Input("shape_positive"),
-                IO.Latent.Input("shape_latent", tooltip="The 512-resolution shape latent output from the first shape-stage KSampler."),
-                IO.Vae.Input("vae"),
-                IO.Combo.Input("target_resolution", [1024,1536], default=1536),
-                IO.Int.Input("max_num_tokens", default=12000, min=0, max=999999, step=1),
-            ],
-            outputs=[
-                IO.Conditioning.Output(display_name="positive"),
-                IO.Latent.Output(),
-            ]
-        )
-
-    @classmethod
-    def execute(cls, shape_positive, shape_latent, vae, 
-                target_resolution, 
-                max_num_tokens):
-        device = comfy.model_management.get_torch_device()
-        vae.prepare_decode(shape_latent["samples"].shape)
-
-        prev_extras = shape_positive["extras"]
-        sparse_structure_resolution = prev_extras["coord_resolution"]
-        if sparse_structure_resolution == 32:
-            from_resolution = 512
-        else:
-            from_resolution = 1024
-        positive_only = {c: shape_positive[c] for c in shape_positive if c not in ["extras", "stage"]}
-        
-        coord_counts = shape_latent.get("coord_counts")
-        shape_vae = vae.first_stage_model
-        feats, coords_512 = flatten_batched_sparse_latent(
-            shape_latent["samples"], shape_latent["coords"], coord_counts,
-        )
-        slat = shape_norm(feats.to(device), coords_512.to(device))
-        hr_coords = shape_vae.upsample_shape(slat.to(vae.vae_dtype), upsample_times=4)
-        
-        lr_resolution = from_resolution
-        hr_resolution = target_resolution
-        ratio = (sparse_structure_resolution / 32)
-        
-        while True:
-            quant_coords = torch.cat([
-                hr_coords[:, :1],
-                ((hr_coords[:, 1:] + 0.5) / (lr_resolution * ratio) * (hr_resolution // 16)).int(),
-            ], dim=1)
-            coords = quant_coords.unique(dim=0)
-            num_tokens = coords.shape[0]
-            if num_tokens < max_num_tokens:
-                if hr_resolution != target_resolution:
-                    print(f"Due to the limited number of tokens, the resolution is reduced to {hr_resolution}.")
-                print(f"Num Tokens: {num_tokens}")
-                break
-            hr_resolution -= 128
-            if hr_resolution < 1024 and target_resolution >= 1024:
-                print(f"Num Tokens: {num_tokens}")
-                hr_resolution = 1024
-                break
-            if hr_resolution < 512:
-                print(f"Num Tokens: {num_tokens}")
-                hr_resolution = 512
-                break
-
-
-        coords = coords.clone()
-        coords[:, 0] = 0 # un solo campione
-        counts = torch.tensor([coords.shape[0]], dtype=torch.int64)
-        coord_resolution = hr_resolution // 16
-        print("Coords resolution: ", coord_resolution)
-
-        batch_size, _, max_tokens_out = infer_batched_coord_layout(coords)
-        in_channels = 32
-        latent = torch.zeros(batch_size, in_channels, max_tokens_out, 1)
-
-        proj_pack = prev_extras.get("proj_feat_pack", None)
-        extras = {
-            **prev_extras,
-            "trellis2_generation_mode": "shape_generation",
-            "trellis2_coords": coords,
-            "trellis2_coord_counts": counts,
-            "coord_resolution": coord_resolution,
-        }
-        if proj_pack is not None:
-            extras["trellis2_proj_feats"] = compute_stage_proj_feats(
-                proj_pack, "shape_1024", coords=coords, coord_resolution=coord_resolution,
-            )
-        positive_out = dict(positive_only)
-        positive_out["extras"] = extras
-        positive_out["stage"] = "shape_generation_cascade"
-        
-        out_latent = {
-            "samples": latent, 
-            "coords": coords, "coord_counts": counts, "coord_resolution": coord_resolution, 
-            "type": "trellis2",
-            "model_frame": shape_latent.get("model_frame",
-                                            "y_up" if proj_pack is not None else "z_up")
-        }
-        
-        return IO.NodeOutput(positive_out, out_latent)
-
-
-class Trellis2TextureStageAlt(IO.ComfyNode):
-    """Sets up the texture-stage sampling pass. Reads coords / coord_counts /
-    coord_resolution and the shape_slat (the per-voxel shape latent) from the
-    incoming shape_latent dict — set there by Trellis2ShapeStage or
-    Trellis2UpsampleStage. Builds an empty sparse latent at the same coord
-    layout and attaches per-stage metadata to the conditioning."""
-    @classmethod
-    def define_schema(cls):
-        return IO.Schema(
-            node_id="Trellis2TextureStageAlt",
-            display_name="Trellis2 Texture Stage Alt",
-            category="model/conditioning/trellis",
-            inputs=[
-                IO.Conditioning.Input("positive"),
-                IO.Latent.Input("shape_latent"),
-            ],
-            outputs=[
-                IO.Conditioning.Output(display_name="positive"),
-                IO.Latent.Output(),
-            ]
-        )
-    
-    @classmethod
-    def execute(cls, positive, shape_latent):
-        channels = 32
-        coords = shape_latent["coords"]
-        coord_resolution = shape_latent.get("coord_resolution")
-
-        batch_size, counts, max_tokens = infer_batched_coord_layout(coords)
-
-        shape_slat = shape_latent["samples"]
-        if shape_slat.ndim == 4:
-            shape_slat, _ = flatten_batched_sparse_latent(shape_slat, coords, counts)
-
-        latent = torch.zeros(batch_size, channels, max_tokens, 1)
-        proj_pack = positive.get("proj_feat_pack", None)
-        model_frame = shape_latent.get("model_frame",
-                                       "y_up" if proj_pack is not None else "z_up")
-
-        extras = {
-            **positive["extras"],
-            "trellis2_generation_mode": "texture_generation",
-            "trellis2_coords": coords,
-            "trellis2_coord_counts": counts,
-            "trellis2_shape_slat": shape_slat,
-            "trellis2_model_frame": model_frame,
-            "coord_resolution": coord_resolution,
-        }
-        if proj_pack is not None and coord_resolution is not None:
-            extras["trellis2_proj_feats"] = compute_stage_proj_feats(
-                proj_pack, "tex_1024", coords=coords, coord_resolution=coord_resolution,
-            )
-        positive_out = dict(positive)
-        positive_out["extras"] = extras
-        positive_out["stage"] = "texture_generation"
-
-        out_latent = {
-            "samples": latent, 
-            "type": "trellis2", 
-            "coords": coords, "coord_counts": counts,
-            "model_frame": shape_latent.get("model_frame",
-                                            "y_up" if proj_pack is not None else "z_up")
-        }
-        
-        if coord_resolution is not None:
-            out_latent["coord_resolution"] = coord_resolution
-        return IO.NodeOutput(positive_out, out_latent)
 
 
 NODE_CLASSES = {
     "Trellis2MultiViewConditioning": Trellis2MultiViewConditioning,
-    "Trellis2SamplerSelect": Trellis2SamplerSelect,
+    "Trellis2MultiViewSamplerSelect": Trellis2MultiViewSamplerSelect,
     "Trellis2MultiViewCFGGuider": Trellis2MultiViewCFGGuider,
-    "Trellis2ShapeStageAlt": Trellis2ShapeStageAlt,
-    "Trellis2UpsampleStageAlt": Trellis2UpsampleStageAlt,
-    "Trellis2TextureStageAlt": Trellis2TextureStageAlt,
 }
 
 NODE_CLASS_NAMES = {
     "Trellis2MultiViewConditioning": "Trellis2 Multi-View Conditioning",
-    "Trellis2SamplerSelect": "Trellis2 Sampler Select",
-    "Trellis2MultiViewCFGGuider": "Trellis2 MultiView CFG Guider",
-    "Trellis2ShapeStageAlt": "Trellis2 Shape Stage Alt",
-    "Trellis2UpsampleStageAlt": "Trellis2 Upsample Stage Alt",
-    "Trellis2TextureStageAlt": "Trellis2 Texture Stage Alt",
+    "Trellis2MultiViewSamplerSelect": "Trellis2 Multi-View Sampler Select",
+    "Trellis2MultiViewCFGGuider": "Trellis2 Multi-View CFG Guider",
 }
