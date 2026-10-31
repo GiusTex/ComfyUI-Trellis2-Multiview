@@ -241,6 +241,24 @@ def _overlap_pairs(tri, nrm, gmin, gmax, dims, limit=1 << 19):
     return torch.cat(keys), torch.cat(tids)
 
 
+# Construct `uniq` from only the 4 neighbors of each intersection, as in C++, and filter `okeys` based on that set
+def _neighbor_keys(ekeys, axes, dims, dev):
+    dz, dy = dims[2], dims[1]
+    c0 = torch.stack([ekeys // (dy * dz), (ekeys // dz) % dy, ekeys % dz], 1)
+    ar = torch.arange(axes.numel(), device=dev)
+    u, v = (axes + 1) % 3, (axes + 2) % 3
+    dims_t = torch.tensor(dims, device=dev)
+    out = []
+    for du in (0, 1):
+        for dv in (0, 1):
+            c = c0.clone()
+            c[ar, u] += du
+            c[ar, v] += dv
+            ok = ((c >= 0) & (c < dims_t)).all(1)
+            out.append((c[ok, 0] * dy + c[ok, 1]) * dz + c[ok, 2])
+    return torch.cat(out)
+
+
 # ------------------------- Main Function -------------------------
 @torch.no_grad()
 def mesh_to_flexible_dual_grid(
@@ -277,8 +295,14 @@ def mesh_to_flexible_dual_grid(
 
     # voxel = union of (intersected angles) and (voxels intersected by the surface)
     okeys, otids = _overlap_pairs(tri, nrm, gmin, gmax, dims)
-    uniq = torch.unique(torch.cat([ekeys, okeys]))
+    uniq = torch.unique(_neighbor_keys(ekeys, axes, dims, dev)) # only the close 4
     N = uniq.numel()
+
+    # face QEF: only already present voxels (like C++ hash table)
+    pos = torch.searchsorted(uniq, okeys).clamp_(max=N - 1)
+    m = uniq[pos] == okeys
+    okeys, otids = okeys[m], otids[m]
+
     inv = torch.searchsorted(uniq, ekeys)
 
     dz, dy = dims[2], dims[1]
