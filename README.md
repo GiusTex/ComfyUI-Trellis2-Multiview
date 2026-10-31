@@ -3,6 +3,8 @@ Partial porting of [visualbruno's wrapper for Trellis2](https://github.com/visua
 
 <img width="506" height="328" alt="image" src="https://github.com/user-attachments/assets/c18a2008-a832-4842-b362-febfbf38499c" />
 
+<img width="6144" height="2048" alt="ComfyUI_temp_zhngh_00006_Comparison" src="https://github.com/user-attachments/assets/dd34f768-b6fb-4ee1-9eb9-570810aba05d" />
+
 #### Release notes
 - v1.1, 31/10/2026:
   - Made the guider work with native OverrideCFG and RescaleCFG nodes;
