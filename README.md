@@ -24,7 +24,7 @@ Partial porting of [visualbruno's wrapper for Trellis2](https://github.com/visua
 
 ### Details (WIP)
  
-[Workflow](https://github.com/GiusTex/ComfyUI-Trellis2-Multiview/blob/main/Trellis2-MultiView-MeshGeneration.json).
+[Workflow](https://github.com/GiusTex/ComfyUI-Trellis2-Multiview/blob/main/Trellis2-MultiView-Mesh-Generation.json).
 
 
 <img width="882" height="281" alt="Trellis2MultiView_NodesExtra_V1" src="https://github.com/user-attachments/assets/2c9a398d-dfb3-4fa6-b40b-c04e7ffeeb19" />
