@@ -60,7 +60,7 @@ Go to `comfyui/custom_nodes` folder, then `git clone https://github.com/GiusTex/
 
   Experimental node. Uses a vibe coded python implementation made by Claude based on visualbruno's `flexible_dual_grid` made in C. Encodes a mesh into a latent, like the one you get from a ksampler.
 
-  It doesn't require extra dependencies and it should work, but returns strange colors when used for texture generation. I suggest using it when still generating the mesh, if you really need it.
+  It doesn't require extra dependencies and it should work, but returns small grey artifacts when used for texture generation. I suggest using it when still generating the mesh, if you really need it.
 
   The mesh resolution can be obtained with `Trellis2 Get Mesh and Coords Resolution` if you still have the latent, or by remembering/checking the resolution the mesh had when you saved it.
 
