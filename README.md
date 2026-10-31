@@ -1,7 +1,7 @@
 # ComfyUI-Trellis2-Multiview
 Partial porting of [visualbruno's wrapper for Trellis2](https://github.com/visualbruno/ComfyUI-Trellis2) in native ComfyUI; specifically, this extensions adds visualbruno's [multiview samplers](https://github.com/visualbruno/ComfyUI-Trellis2/blob/main/trellis2/pipelines/samplers/flow_euler.py) for Trellis2.
 
-<img width="270" height="334" alt="image" src="https://github.com/user-attachments/assets/d0ad3f98-58ba-4bda-9a2d-87563cecb961" />
+<img width="506" height="328" alt="image" src="https://github.com/user-attachments/assets/c18a2008-a832-4842-b362-febfbf38499c" />
 
 #### Release notes
 - v1.1, 31/10/2026:
